@@ -1,0 +1,345 @@
+---
+title: "Boston Crime Analysis - Machine Learning"
+author: "James Park"
+date: "12/5/2018"
+output: html_document
+---
+
+# Objective
+
+The objective of this portion is quantitative prediction. In this project, we will explore four approaches to supervised maching learning. The first modeling choices we make are to use regression instead of classification to include more flexible models at the expense of interpretability. As we deal with count data, we will use a poisson distribution. We will compare the outcomes of the following models:
+
+####1.Random gorest using 'ranger'
+####2.Generalized linear model using 'glm'
+####3.Stochastic gradient boosting using 'gbm'
+####4.Cubist using 'cubist'
+
+```{r setup, echo = TRUE, results='hide',warnings=FALSE, message=FALSE}
+# installing required packages
+lib <- c("tidyverse", "ggthemes", "caret", "rpart", "rpart.plot", "modelr", "gridExtra",
+         "lubridate", "broom","stringr")
+
+lapply(lib, require, character.only = TRUE)
+```
+
+We will explore the data by focusing on the 9 major crime categories in the Boston districts. The dataset covers from 2015/06 to 2018/11.
+
+```{r, echo = TRUE, results='hide',warnings=FALSE}
+df <- read.csv("crime.csv")
+# Exploratory analysis 1
+# Color can handle a maximum of 9 values; analysis is limited to 9 major crime codes
+offense <- as.data.frame(table(df$OFFENSE_CODE_GROUP)) # list all the counts
+offense <- offense[order(offense$Freq),]
+offense <- offense[59:67,] # Most frequent offense
+names <- c("Verbal Disputes", "Vandalism", "Simple Assault",
+  "Drug Violation", "Other", "Investigate Person",
+  "Medical Assistance", "Larceny", "Motor Vehicle Accident Response")
+
+only9 <- df[df$OFFENSE_CODE_GROUP %in% names,] # dataframe with only 9 crimes
+factor(only9$OFFENSE_CODE_GROUP) # drop the factor names
+
+```
+
+# Reusable objects
+
+## Training control
+
+Repeated k-fold cross-validation is used as it is well-known with models generally irrespective of their fitting procedures. The observations are split into "k" equally separated folds for each model. This balance is used for training the model. This 'train_contol' variable is used as our training control so we can reuse these parameters with each of our regression models. 
+
+```{r,warnings=FALSE, message=FALSE}
+train_control <-
+  trainControl(
+    method = "repeatedcv",
+    number = 10,
+    repeats = 5,
+    allowParallel = TRUE,
+    seeds = c(1:51)
+  )
+
+# reusable theme for model predictions
+theme_thinkr <- theme_economist() + theme(
+  rect = element_rect(fill = "#f9f5f1"),
+  plot.title = element_text(size = 12),
+  plot.subtitle = element_text(size = 6),
+  strip.text = element_text(size = 9),
+  axis.text.x = element_text(size = 7),
+  legend.text = element_text(size = 7),
+  plot.background = element_rect(fill = "#f9f5f1")
+)
+
+# our wrangled final data frame
+only9 <- df[df$OFFENSE_CODE_GROUP %in% names,]
+
+crime <-
+  only9 %>%
+  select(YEAR, MONTH, DISTRICT, OFFENSE_CODE_GROUP) %>%
+  mutate(
+    year=factor(YEAR),
+    month=factor(MONTH),
+    maj_cat=factor(OFFENSE_CODE_GROUP),
+    borough=factor(DISTRICT)
+  ) %>%
+  filter(!(borough == "")) %>%
+  group_by(year, month, borough, maj_cat) %>%
+  summarise(count = n())
+```
+
+# Generalized Linear Model
+
+We use the glm function with a Poisson distriution for count data. By looking at the R-squared and root mean squared error (RSME) both with and without the interaction term of district and major category, one can see that the model with this interaction term provides a stronger correlation between predictions and actual results with lower RSME. RSME is prioritized as a key metric for evaluating models in this project, which is especially useful to measure prediction error with respect to the actual data. 
+
+```{r, warnings=FALSE, message=FALSE, include=FALSE}
+model_GLM <-
+  train(
+    count ~ .,
+    data = crime,
+    method = "glm",
+    metric = "Rsquared",
+    family = "poisson",
+    trControl = train_control
+  )
+```
+
+```{r}
+## glm
+gather_residuals(crime, model_GLM, .resid = "resid", .model = "model") %>%
+  ggplot(aes(count, resid, colour = maj_cat)) +
+  geom_point() +
+  ggtitle("GLM residuals spread out at higher counts") +
+  geom_hline(yintercept = 20, lty = 2, size = 1) +
+  geom_abline(intercept = 80, slope = 0.15, colour = "grey80", size = 2, lty = 3) +
+  geom_abline(intercept = -80, slope = -0.17, colour = "grey80", size = 2, lty = 3) +
+  scale_colour_economist() +
+  theme_thinkr
+
+
+crime %>%
+  spread_predictions("Generalized Linear Model" = model_GLM) %>%
+  gather(key = model,
+         value = pred,-year,-month,-borough,-maj_cat,-count) %>%
+  rename(act = count) %>%
+  ggplot(aes(pred, act, colour = maj_cat)) +
+  geom_point(alpha = 0.3, size = 2) +
+  geom_abline(colour = "black", lty = 2) +
+  geom_text(
+    x = 250,
+    y = 50,
+    aes(
+      label = paste0(
+        "Method = glm","\n",
+        "Type = regression","\n",
+        "RMSE = ",
+        model_GLM$results$RMSE,"\n",
+        "R-Squared = ",
+        model_GLM$results$Rsquared)
+      )) +
+  facet_wrap( ~ model) +
+  scale_colour_economist(name = "Major Category") +
+  scale_y_continuous(breaks = seq(0, 300, by = 50),
+                     limits = c(0, 300)) +
+  scale_x_continuous(breaks = seq(0, 300, by = 50),
+                     limits = c(0, 300)) +
+  ggtitle("Generalized Linear Model") +
+  labs(x = "Predictions", y = "Actual") +
+  guides(colour = guide_legend(override.aes = list(size = 3))) +
+  theme_thinkr
+```
+
+By plotting the residuals of the GLM model, an increasing spread is shown as the count gets larger.
+
+# Recursive partitioning
+
+We will run a recursive partitioning model using the caret package to tune and refine the model. This will create consistent outputs across the four models, which will help us to pull useful information out of the final models to annotate the final plot.
+
+```{r,warnings=FALSE, message=FALSE}
+tune_grid <-
+  expand.grid(
+    cp = 0.00001 
+    )
+
+model_RP <-
+  train(
+    count ~ .,  # the effect of interacting term is negligible in this model
+    data = crime,
+    method = "rpart",
+    metric = "RMSE",
+    parms = list(method = "poisson"),
+    tuneGrid = tune_grid,
+    trControl = train_control
+    )
+```
+
+# Random Forest
+
+Random Forest combines many decision trees by spliting the training data horizontally. Then, random forest randomly samples the predictors verically. 
+
+```{r,warnings=FALSE, message=FALSE}
+tune_grid <-
+  expand.grid(
+    mtry = 2,
+    splitrule = "variance",
+    min.node.size = 5
+  )
+
+model_RF2 <-
+  train(
+    count ~ .,
+    data = crime,
+    method = "ranger",
+    num.trees = 500,
+    metric = "RMSE",
+    respect.unordered.factors = TRUE,
+    tuneGrid = tune_grid,
+    trControl = train_control
+  )
+
+
+crime %>%
+  spread_predictions("Random Forest | mtry = 02" = model_RF2) %>%
+  gather(key = model,
+         value = pred,-year,-month,-borough,-maj_cat,-count) %>%
+  rename(act = count) %>%
+  ggplot(aes(pred, act, colour = maj_cat)) +
+  geom_point(alpha = 0.3, size = 2) +
+  geom_abline(colour = "black", lty = 2) +
+  geom_text(
+    x = 250,
+    y = 50,
+    aes(
+      label = paste0(
+        "Method = ranger","\n",
+        "Type = regression","\n",
+        "RMSE = ",
+        model_RF2$results$RMSE,"\n",
+        "R-Squared = ",
+        model_RF2$results$Rsquared)
+      )) +
+  facet_wrap( ~ model) +
+  scale_colour_economist(name = "Major Category") +
+  scale_y_continuous(breaks = seq(0, 300, by = 50),
+                     limits = c(0, 300)) +
+  scale_x_continuous(breaks = seq(0, 300, by = 50),
+                     limits = c(0, 300)) +
+  ggtitle("Random Forest") +
+  labs(x = "Predictions", y = "Actual") +
+  guides(colour = guide_legend(override.aes = list(size = 3))) +
+  theme_thinkr
+```
+
+
+# Stochastic Gradient Boosting
+
+Stochastic gradient boosting is another useful way to improve our predictions from decisions trees as it is better with natural selection with fitter successive trees.
+
+```{r,warnings=FALSE, message=FALSE}
+tune_grid <-
+  expand.grid(
+    interaction.depth = 10, 
+    n.trees = 500,
+    shrinkage = 0.1,
+    n.minobsinnode = 5 
+  )
+
+model_SGB <-
+  train(
+    count ~ .,
+    data = crime,
+    distribution = "poisson",
+    method = "gbm",
+    metric = "RMSE",
+    tuneGrid = tune_grid,
+    verbose = FALSE,
+    bag.fraction = 0.5,
+    trControl = train_control
+  )
+
+crime %>%
+  spread_predictions("Stochastic Gradient Boossting" = model_SGB) %>%
+  gather(key = model,
+         value = pred,-year,-month,-borough,-maj_cat,-count) %>%
+  rename(act = count) %>%
+  ggplot(aes(pred, act, colour = maj_cat)) +
+  geom_point(alpha = 0.3, size = 2) +
+  geom_abline(colour = "black", lty = 2) +
+  geom_text(
+    x = 250,
+    y = 50,
+    aes(
+      label = paste0(
+        "Method = gbm","\n",
+        "Type = regression","\n",
+        "RMSE = ",
+        model_SGB$results$RMSE,"\n",
+        "R-Squared = ",
+        model_SGB$results$Rsquared)
+      )) +
+  facet_wrap( ~ model) +
+  scale_colour_economist(name = "Major Category") +
+  scale_y_continuous(breaks = seq(0, 300, by = 50),
+                     limits = c(0, 300)) +
+  scale_x_continuous(breaks = seq(0, 300, by = 50),
+                     limits = c(0, 300)) +
+  ggtitle("Stochastic Gradient Boosting") +
+  labs(x = "Predictions", y = "Actual") +
+  guides(colour = guide_legend(override.aes = list(size = 3))) +
+  theme_thinkr
+
+```
+
+# Cubist
+
+Cubias is a rule-based variant of other tree models.
+
+```{r,warnings=FALSE, message=FALSE}
+tune_grid <-
+  expand.grid(
+    committees = 80, 
+    neighbors = 9 
+  )
+
+model_Cub <-
+  train(count ~ .,
+        data = crime,
+        method = "cubist",
+        metric = "RMSE",
+        tuneGrid = tune_grid,
+        trControl = train_control
+  )
+
+crime %>%
+  spread_predictions("model_Cubist" = model_Cub) %>%
+  gather(key = model,
+         value = pred,-year,-month,-borough,-maj_cat,-count) %>%
+  rename(act = count) %>%
+  ggplot(aes(pred, act, colour = maj_cat)) +
+  geom_point(alpha = 0.3, size = 2) +
+  geom_abline(colour = "black", lty = 2) +
+  geom_text(x = 250, y = 50,
+    aes(
+      label = paste0(
+        "Method = cubist","\n",
+        "Type = regression","\n",
+        "RMSE = ",
+        model_Cub$results$RMSE,"\n",
+        "R-Squared = ",
+        model_Cub$results$Rsquared)
+      )) +
+  facet_wrap( ~ model) +
+  scale_colour_economist(name = "Major Category") +
+  scale_y_continuous(breaks = seq(0, 300, by = 50),
+                     limits = c(0, 300)) +
+  scale_x_continuous(breaks = seq(0, 300, by = 50),
+                     limits = c(0, 300)) +
+  ggtitle("Cubist") +
+  labs(x = "Predictions", y = "Actual") +
+  guides(colour = guide_legend(override.aes = list(size = 3))) +
+  theme_thinkr
+```
+
+# Conclusion
+
+Supervised machine learning outcomes from the CART and GLM models have weaker RSMESs based on our models, and they also show more dispesion in the predictions at the higher counts. Stochastic gradient boosting and Cubist perofrmed the best as they have the smallest RSME and the largest R-squared. From visual assessment, these two models also handle the higher counts better as shown from the visually tighter clustering. Generalized linear model performed the poorest of all four models scompared. 
+
+# Discussion
+
+We could have had a better comparison of different machine learning techniques if we have sufficient information in the data. If we don't have sufficient data, one cannot uniquely approximate n parameters with less than n data points. Even if we had more data points than n parameters, we may get poor results due to rank deficiency. More data may be needed to help the algorithms to choose the best solution that represents all of the data with minimum error. At times, one can have more data than he or she needs, but some points may be replicates. Although replication may be helpful to reduce the noise, it is not helpful to increase numerical rank as it does not add any information content- all it does is decreasing noise at location where she or he already has information. Information may be in wrong places. For instance, one can't fit a two dimensional quadratic model if all she or he have are points that lie in a straight line in in two dimensions. Even with billions of data pointss, one may not have sufficient information to intelligently estimate more than a constant model. 
